@@ -1,0 +1,71 @@
+services:
+
+  # --- MinIO: object storage gia lap S3, mien phi, tu host -----------------
+  # Ly do dung: hau het cong ty data hien nay tach rieng "cho luu data"
+  # (object storage: S3/ADLS/GCS) khoi "cho tinh toan" (Spark/EMR/Databricks).
+  # MinIO noi API giong AWS S3 100% nen code viet cho MinIO chuyen sang S3
+  # thuc te tren cloud gan nhu khong doi.
+  minio:
+    image: minio/minio:latest
+    container_name: taxi_minio
+    ports:
+      - "9000:9000"   # S3 API endpoint
+      - "9001:9001"   # Web console (xem bucket/object bang UI)
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --- minio-init: chi chay 1 lan de tao san cac bucket ---------------------
+  # Day la vi du dau tien ve "infrastructure as code": thay vi bam chuot tao
+  # bucket tren UI (kho tai tao lai, khong version-control duoc), ta khai bao
+  # bang lenh trong container roi cho no tu ket thuc (exit 0).
+  minio-init:
+    image: minio/mc:latest
+    container_name: taxi_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      mc mb -p local/raw &&
+      mc mb -p local/silver &&
+      mc mb -p local/gold &&
+      echo 'Buckets ready: raw, silver, gold' &&
+      exit 0
+      "
+
+  # --- jobs: noi chay code Python/PySpark cua chung ta -----------------------
+  # Container nay KHONG chay lien tuc (khong co lenh "up" mai) - ta se goi
+  # `docker compose run --rm jobs python <script>` moi khi muon thuc thi 1
+  # job, giong dung cach Airflow/cron se goi job trong production sau nay.
+  jobs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: taxi_jobs
+    depends_on:
+      - minio
+    env_file:
+      - .env
+    ports:
+      - "4040:4040"
+    volumes:
+      - ./ingestion:/app/ingestion
+      - ./transform:/app/transform
+      - ./data:/app/data
+    working_dir: /app
+
+volumes:
+  minio_data:
