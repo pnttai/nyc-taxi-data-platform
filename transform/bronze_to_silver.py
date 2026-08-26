@@ -107,7 +107,7 @@ def main():
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")  # bot log rac, chi giu warning/error
-
+    spark.conf.set("spark.sql.shuffle.partitions", "8")
     print("=" * 60)
     print("BUOC 3/4: Doc + lam sach du lieu (transform)")
     print("=" * 60)
@@ -122,35 +122,57 @@ def main():
     print(f"Schema goc ({len(files)} file duoc gop lai thanh 1 DataFrame):")
     df.printSchema()
 
-    clean = (
-        df
-        # loc bo ban ghi ro rang la du lieu ban/loi: trip_distance <= 0,
-        # fare_amount am, passenger_count <= 0. Day la buoc "data quality"
-        # co ban nhat ma moi pipeline production deu phai co.
-        .filter(F.col("trip_distance") > 0)
-        .filter(F.col("fare_amount") > 0)
-        .filter(F.col("passenger_count") > 0)
-        .filter(F.col("tpep_dropoff_datetime") > F.col("tpep_pickup_datetime"))
-        # them cot tinh toan (derived column) - gia tri nay khong co trong
-        # raw data, ta tu tinh o tang silver de tang gold/dashboard dung lai
-        # ma khong phai tinh lai nhieu lan.
-        .withColumn(
-            "trip_duration_minutes",
-            (
-                F.unix_timestamp("tpep_dropoff_datetime")
-                - F.unix_timestamp("tpep_pickup_datetime")
-            )
-            / 60.0,
+    print("Loc rac + tinh cot phu, dem so dong bi loai theo TUNG ly do rieng:")
+    total = df.count()
+    print(f"  Tong so dong raw ban dau:         {total:,}")
+
+    step1 = df.filter(F.col("trip_distance") > 0)
+    n1 = step1.count()
+    print(f"  Sau loc trip_distance > 0:        {n1:,}  (loai {total - n1:,})")
+
+    step2 = step1.filter(F.col("fare_amount") > 0)
+    n2 = step2.count()
+    print(f"  Sau loc fare_amount > 0:          {n2:,}  (loai {n1 - n2:,})")
+
+    step3 = step2.filter(F.col("passenger_count") > 0)
+    n3 = step3.count()
+    print(f"  Sau loc passenger_count > 0:      {n3:,}  (loai {n2 - n3:,})")
+
+    step4 = step3.filter(F.col("tpep_dropoff_datetime") > F.col("tpep_pickup_datetime"))
+    n4 = step4.count()
+    print(f"  Sau loc dropoff > pickup:         {n4:,}  (loai {n3 - n4:,})")
+
+    with_duration = step4.withColumn(
+        "trip_duration_minutes",
+        (
+            F.unix_timestamp("tpep_dropoff_datetime")
+            - F.unix_timestamp("tpep_pickup_datetime")
         )
+        / 60.0,
+    )
+
+    # Bai tap 1: loai chuyen di qua ngan (<1 phut) hoac qua dai (>180 phut)
+    # - day la loai outlier thuong gap do loi GPS/thiet bi, khong phai loi
+    # nhap lieu ro rang nhu am/duong nhu 4 dieu kien tren.
+    step5 = with_duration.filter(
+        (F.col("trip_duration_minutes") >= 1) & (F.col("trip_duration_minutes") <= 180)
+    )
+    n5 = step5.count()
+    print(f"  Sau loc trip_duration 1-180 phut: {n5:,}  (loai {n4 - n5:,})")
+
+    clean = (
+        step5
         .withColumn("pickup_date", F.to_date("tpep_pickup_datetime"))
         .withColumn("pickup_year", F.year("tpep_pickup_datetime"))
         .withColumn("pickup_month", F.month("tpep_pickup_datetime"))
+        # Bai tap 2: is_weekend - Spark quy uoc dayofweek: 1=Chu Nhat, 7=Thu Bay
+        .withColumn("is_weekend", F.dayofweek("tpep_pickup_datetime").isin([1, 7]))
     )
 
-    before = df.count()   # ACTION dau tien -> Spark moi thuc su doc toan bo file
-    after = clean.count()  # ACTION thu hai -> Spark thuc su chay lai filter
+    before = total
+    after = clean.count()
     print(f"So dong truoc khi lam sach: {before:,}")
-    print(f"So dong sau khi lam sach:   {after:,}  (loai {before - after:,} dong ban/loi)")
+    print(f"So dong sau khi lam sach:   {after:,}  (loai tong cong {before - after:,} dong)")
 
     print("=" * 60)
     print("BUOC 4/4: Ghi ra silver zone, PARTITION BY nam/thang")
